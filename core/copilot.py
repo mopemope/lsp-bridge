@@ -1,6 +1,8 @@
+import os
 import time
 import subprocess
-from core.utils import *
+import uuid
+from core.utils import epc_arg_transformer, message_emacs, get_emacs_vars, get_os_name, generate_request_id, path_to_uri, eval_in_emacs, logger
 from subprocess import PIPE
 from core.lspserver import LspServerSender, LspServerReceiver
 import threading
@@ -47,7 +49,7 @@ class Copilot:
     def check_node_version(self):
         version = subprocess.check_output([self.node_path, '-v'], stderr=subprocess.STDOUT, universal_newlines=True).strip()
         major_version = int(version.split('.')[0].lstrip('v'))
-        return major_version >= 16
+        return major_version >= 20
 
     def start_copilot(self):
         self.get_info()
@@ -57,35 +59,64 @@ class Copilot:
         self.is_run = True
 
         if not self.check_node_version():
-            message_emacs('To use copilot, Please install node version >= 16')
+            message_emacs('To use copilot, Please install node version >= 20')
             return
 
         npm_package_path = subprocess.check_output(["npm.cmd" if get_os_name() == "windows" else "npm", 'root', '-g'], universal_newlines=True).strip()
-        agent_path =  os.path.join(npm_package_path, "copilot-node-server", "copilot/dist/agent.js")
+        #agent_path =  os.path.join(npm_package_path, "copilot-node-server", "copilot/dist/agent.js")
+        agent_path =  os.path.join(npm_package_path, "@github", "copilot-language-server/dist/language-server.js")
 
-        self.copilot_subprocess = subprocess.Popen([self.node_path, agent_path],
+        if not os.path.exists(agent_path):
+            message_emacs(f'Copilot agent not found at {agent_path}')
+            return  
+        
+        self.copilot_subprocess = subprocess.Popen([self.node_path, agent_path, "--stdio"],
                                                    stdin=PIPE,
                                                    stdout=PIPE,
                                                    stderr=None)
 
         self.receiver = LspServerReceiver(self.copilot_subprocess, 'copilot')
         self.receiver.start()
-
+        
         self.sender = LspServerSender(self.copilot_subprocess, 'copilot', 'copilot_backend')
         self.sender.start()
 
         self.dispatcher = threading.Thread(target=self.message_dispatcher)
         self.dispatcher.start()
 
-        self.sender.send_request('initialize', {'capabilities': {'workspace': {'workspaceFolders': True}}}, generate_request_id(), init=True)
+        self.wait_id = generate_request_id()   
+        self.sender.send_request('initialize', {
+            'processId': os.getpid(),
+            'clientInfo': {
+                "name": "emacs",
+                "version": "lsp-bridge"
+            },
+            'capabilities': {
+                'workspace': {'workspaceFolders': True}
+            },
+            'initializationOptions': {
+                'editorInfo': {
+                    'name': 'Emacs',
+                    'version': '28.0'
+                },
+                'editorPluginInfo': {
+                    'name': 'GitHub Copilot for lsp-bridge',
+                    'version': '0.0.1'
+                },
+                'networkProxy': epc_arg_transformer(self.proxy)
+            },
+        }, self.wait_id, init=True)
+        while self.wait_id is not None:
+            time.sleep(0.1)
+        self.sender.send_notification("initialized", {}, init=True)
+        self.sender.send_notification("workspace/didChangeConfiguration", {
+            'settings': {
+                'telemetryLevel': 'off'
+            }
+        }, init=True)
 
         self.sender.initialized.set()
-
-        editor_info = {'editorInfo': {'name': 'Emacs', 'version': '28.0'},
-                       'editorPluginInfo': {'name': 'lsp-bridge', 'version': '0.0.1'},
-                       'networkProxy': epc_arg_transformer(self.proxy)}
-        self.sender.send_request('setEditorInfo', editor_info, generate_request_id())
-
+            
         self.is_initialized = True
 
     def get_language_id(self, editor_mode):
@@ -94,11 +125,13 @@ class Copilot:
 
     def accpet(self, id):
         self.sender.send_request('notifyAccepted', [{'id': id}, ], generate_request_id())
-
+    
+    
     def message_dispatcher(self):
         try:
             while True:
                 message = self.receiver.get_message()
+                # message_emacs(f'receive {message}')
                 message = message['content']
 
                 if 'method' in message and message['method'] == 'LogMessage':
@@ -111,6 +144,7 @@ class Copilot:
                     completion_candidates = []
 
                     for completion in message['result']['completions']:
+                        message_emacs(f'copilot completion: {completion}')
                         label = completion['text']
                         labels = label.strip().split("\n")
                         first_line = labels[0]
@@ -140,6 +174,48 @@ class Copilot:
                         completion_candidates.append(candidate)
 
                     eval_in_emacs("lsp-bridge-search-backend--record-items", "copilot", completion_candidates)
+                elif 'result' in message and 'items' in message['result']:
+                    
+                    # inline completion response
+                    completion_candidates = []
+
+                    for item in message['result']['items']:
+                        message_emacs(f'copilot inline completion: {item}')
+                        label = item['insertText']
+                        labels = label.strip().split("\n")
+                        first_line = labels[0]
+
+                        document = f"```{self.current_language_id}\n{label}\n```"
+
+                        display_label = first_line
+                        if len(first_line) > self.display_label_max_length:
+                            display_label = "... " + display_label[len(first_line) - self.display_label_max_length:]
+
+                        if len(labels) <= 1 and len(first_line) <= self.display_label_max_length:
+                            document = ""
+
+                        line = item['range']['start']['line']
+                        id = str(uuid.uuid4())
+                        candidate = {
+                            "key": label,
+                            "icon": "copilot",
+                            "label": label,
+                            "displayLabel": first_line,
+                            "annotation": "Copilot!",
+                            "backend": "copilot",
+                            "documentation": document,
+                            "id": id,
+                            "line": line,
+                        }
+                        
+                        # accept the completion command
+                        # command = item['command']['command']
+                        # command_args = item['command']['arguments']
+                        
+                        completion_candidates.append(candidate)
+
+                    eval_in_emacs("lsp-bridge-search-backend--record-items", "copilot", completion_candidates)
+
         except:
             logger.error(traceback.format_exc())
 
@@ -166,7 +242,11 @@ class Copilot:
                         'text': text
                     }
                 })
-
+            
+    def accept(self, id):
+        message_emacs(f'accept {id}')
+        self.sender.send_request('notifyAccepted', [{'id': id}, ], generate_request_id())
+        
     def complete(self,  position, editor_mode, file_path, relative_path, tab_size, text, insert_spaces):
         if len(file_path) == 0:
             return
@@ -199,12 +279,38 @@ class Copilot:
                 "position": {"line": position[1], "character": position[3]},
             }
         }
+        # inline completions message
+        #self.inline_message = {
+        #    "textDocument": {
+        #        "uri": path_to_uri(file_path),
+        #        "version": self.file_versions[file_path],
+        #   },
+        #    "position": {
+        #        "line": position[1],
+        #        "character": position[3]
+        #    },
+        #    "context": {
+        #        "triggerKind": 2,
+        #    },
+        #    "formattingOptions": {
+        #        "tabSize": tab_size,
+        #        "insertSpaces": bool(insert_spaces),
+        #    },            
+        #}
+        
         self.file_versions[file_path] += 1
 
         self.try_completion_timer = threading.Timer(0.0, self.do_complete)
         self.try_completion_timer.start()
 
     def do_complete(self):
+        # send inline completion request
+        #self.sender.send_request(
+        #    method='textDocument/inlineCompletion',
+        #    params=self.inline_message,
+        #    request_id=generate_request_id()
+        #)
+        # send completion request
         request_id = generate_request_id()
         self.sender.send_request(
             method='getCompletions',
@@ -236,14 +342,15 @@ class Copilot:
         self.sender.send_request('checkStatus', {"dummy": "checkStatus"}, self.wait_id)
         while self.wait_id is not None:
             time.sleep(0.1)
+                
         result = self.wait_response['result']
         message_emacs(f'Copilot status: {result["status"]}' + \
-                      f' as user {result["user"]}' if 'user' in result else '')
+                      f' as user {result["user"]}' if 'user' in result else 'NotSignedIn')
 
     def login(self):
         self.start_copilot()
         self.wait_id = generate_request_id()
-        self.sender.send_request('signInInitiate', {'dummy': "signInInitiate"}, self.wait_id)
+        self.sender.send_request('signIn', {'dummy': "signInInitiate"}, self.wait_id)
         while self.wait_id is not None:
             time.sleep(0.1)
         result = self.wait_response['result']
